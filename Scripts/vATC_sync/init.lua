@@ -123,6 +123,7 @@ local display = { visible = true, manually_hidden = false }
 local active_callsign = ""
 local last_poll = 0
 local last_fms_check = 0
+local in_draw_loop = false  -- Safety flag for OpenGL calls
 
 -- ============================================================================
 -- VATSIM DATA
@@ -482,6 +483,7 @@ end
 -- DRAW
 -- ============================================================================
 function vatc_sync_draw()
+    if not in_draw_loop then return end  -- Safety: only draw in draw loop
     if not CONFIG.show_bar then return end
     if not SCREEN_WIDTH or not SCREEN_HIGHT then return end
 
@@ -620,7 +622,9 @@ function vatc_sync_draw()
 end
 
 function vatc_sync_draw_safe()
+    in_draw_loop = true
     local ok, err = pcall(vatc_sync_draw)
+    in_draw_loop = false
     if not ok then log_msg("Draw error: " .. tostring(err)) end
 end
 
