@@ -170,21 +170,31 @@ local function find_pilot(data, cs)
     return nil
 end
 
--- Find pilot by matching position (within ~0.5nm)
+-- Find pilot by matching position (within ~2nm for better matching)
 local function find_pilot_by_position(data)
     if not data or not data.pilots then return nil end
     local my_lat, my_lon = xp_latitude, xp_longitude
     if not my_lat or not my_lon then return nil end
 
+    local best_pilot = nil
+    local best_dist = 999
+
     for _, p in ipairs(data.pilots) do
         if p.latitude and p.longitude then
             local dist = UTILS.calc_distance_nm(my_lat, my_lon, p.latitude, p.longitude)
-            if dist < 0.5 then
-                return p
+            -- Match within 2nm, pick closest
+            if dist < 2.0 and dist < best_dist then
+                best_pilot = p
+                best_dist = dist
             end
         end
     end
-    return nil
+
+    if best_pilot then
+        log_msg("Found pilot by position: " .. best_pilot.callsign .. " at " .. string.format("%.2f", best_dist) .. "nm")
+    end
+
+    return best_pilot
 end
 
 local function find_prefile(data, cs)
@@ -517,8 +527,12 @@ function vatc_sync_draw()
     local dest = vatsim_fp.arrival ~= "" and vatsim_fp.arrival or flightplan.destination
     local cs = state.callsign ~= "" and state.callsign or "---"
     local sqwk = UTILS.num_to_squawk(xp_transponder or 2000)
-    -- COM1 freq from aircraft, default 122.800 UNICOM
-    local freq = UTILS.xplane_to_freq(xp_com1_freq or 12280)
+    -- COM1 freq from aircraft, default 122.800 UNICOM when offline or no freq
+    local raw_freq = xp_com1_freq or 0
+    local freq = "122.800"
+    if raw_freq > 0 then
+        freq = UTILS.xplane_to_freq(raw_freq)
+    end
     local atc_type = atc.current and atc.current.type or "---"
     local fir = atc.fir or "---"
     local fir_freq = atc.current and UTILS.format_freq(atc.current.frequency) or ""
@@ -626,8 +640,9 @@ last_poll = os.time()
 last_fms_check = os.time()
 fetch_vatsim()
 
+-- FlyWithLua callbacks - do_often runs every ~1 sec, do_every_frame for drawing
 do_often("vatc_sync_poll()")
-do_every_draw("vatc_sync_draw_safe()")
+do_every_frame("vatc_sync_draw_safe()")
 
 log_msg("vATC Sync " .. VERSION:get_full() .. " ready")
 logMsg("vATC Sync " .. VERSION:get_full() .. " loaded")

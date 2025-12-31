@@ -21,11 +21,12 @@ function UTILS.freq_to_xplane(freq_str)
 end
 
 -- Convert X-Plane frequency to display format
--- com1_freq_hz returns frequency in 10 Hz units (118.300 = 11830)
+-- com1_freq_hz returns frequency in 10 kHz units (118.300 = 11830, 122.800 = 12280)
 function UTILS.xplane_to_freq(hz)
     if not hz or hz == 0 then return "122.800" end
-    -- Format: 11830 -> 118.300
-    return string.format("%.3f", hz / 100)
+    -- Format: 12280 -> 122.800 (divide by 100, then format with 3 decimals)
+    local mhz = hz / 100
+    return string.format("%.3f", mhz)
 end
 
 -- Get controller type from callsign
