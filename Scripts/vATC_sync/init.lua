@@ -640,9 +640,9 @@ last_poll = os.time()
 last_fms_check = os.time()
 fetch_vatsim()
 
--- FlyWithLua callbacks - do_often runs every ~1 sec, do_every_frame for drawing
+-- FlyWithLua callbacks
 do_often("vatc_sync_poll()")
-do_every_frame("vatc_sync_draw_safe()")
+do_every_draw("vatc_sync_draw_safe()")
 
 log_msg("vATC Sync " .. VERSION:get_full() .. " ready")
 logMsg("vATC Sync " .. VERSION:get_full() .. " loaded")
