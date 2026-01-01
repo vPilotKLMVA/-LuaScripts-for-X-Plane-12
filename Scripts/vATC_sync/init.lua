@@ -1,5 +1,14 @@
 -- ============================================================================
 -- vATC SYNC for X-Plane 12
+-- Real-time VATSIM integration with SimBrief flight planning
+-- ============================================================================
+--
+-- Copyright (c) 2025 vPilot KLMVA
+-- Licensed under the MIT License
+--
+-- GitHub: https://github.com/vPilotKLMVA/-LuaScripts-for-X-Plane-12
+-- Forum: https://forums.x-plane.org/profile/422092-pilot-mcwillem/
+--
 -- Uses FlyWithLua modules: dkjson, socket.http
 -- ============================================================================
 
@@ -56,10 +65,22 @@ end
 local VERSION = safe_load(script_dir .. "version.lua", "version")
 local CONFIG = safe_load(script_dir .. "config.lua", "config")
 local UTILS = safe_load(script_dir .. "utils.lua", "utils")
+local XPLM_FFI = safe_load(script_dir .. "xplm_ffi.lua", "xplm_ffi")
+local ALARMS = safe_load(script_dir .. "alarms.lua", "alarms")
 
 if not VERSION or not CONFIG or not UTILS then
-    log_msg("FATAL: modules failed")
+    log_msg("FATAL: core modules failed")
     return
+end
+
+-- Optional modules (won't fail if missing)
+if XPLM_FFI then
+    local ffi_ok = XPLM_FFI.init()
+    log_msg("XPLM FFI: " .. (ffi_ok and "OK" or "not available"))
+end
+
+if ALARMS then
+    log_msg("Alarms: OK")
 end
 
 -- Load FWL libraries
@@ -80,6 +101,17 @@ else
     log_msg("socket.http not found")
 end
 
+-- Try to load HTTPS support (LuaSec)
+local https = nil
+local ltn12 = nil
+local ok_https = pcall(function() https = require("ssl.https") end)
+if ok_https and https then
+    log_msg("ssl.https OK")
+else
+    log_msg("ssl.https not available")
+end
+pcall(function() ltn12 = require("ltn12") end)
+
 -- ============================================================================
 -- DATAREFS
 -- ============================================================================
@@ -98,6 +130,7 @@ dataref("xp_wind_speed", "sim/weather/wind_speed_kt", "readonly")
 dataref("xp_gps_dme_dist", "sim/cockpit2/radios/indicators/gps_dme_distance_nm", "readonly")
 dataref("xp_gps_dme_time", "sim/cockpit2/radios/indicators/gps_dme_time_min", "readonly")
 dataref("xp_parking_brake", "sim/cockpit2/controls/parking_brake_ratio", "readonly")
+dataref("xp_xpdr_mode", "sim/cockpit2/radios/actuators/transponder_mode", "readonly")
 
 -- ============================================================================
 -- STATE
@@ -128,8 +161,12 @@ local vatsim_fp = {
     approach = "",
     dep_metar = "",
     arr_metar = "",
+    dep_metar_qnh = "1013",  -- Extracted from METAR
+    arr_metar_qnh = "1013",  -- Extracted from METAR
     sched_etd = 0,  -- Unix timestamp
-    sched_eta = 0   -- Unix timestamp
+    sched_eta = 0,  -- Unix timestamp
+    cruise_fl = "",  -- Cruise flight level
+    step_climb_fl = ""  -- Next step climb FL (nFIR sFL)
 }
 
 local flightplan = {
@@ -153,11 +190,27 @@ local progress = {
     brake_was_set = true -- Track brake state changes
 }
 
-local display = { visible = true, manually_hidden = false }
+local display = {
+    visible = true,
+    manually_hidden = false,
+    pinned = true  -- NEW: Pin/unpin toggle
+}
 local active_callsign = ""
 local last_poll = 0
 local last_fms_check = 0
 local in_draw_loop = false  -- Safety flag for OpenGL calls
+local last_draw_update = 0  -- Frame cache timing
+local draw_cache = {        -- Cached draw values to prevent flickering
+    origin = "---", dest = "---", cs = "---", sqwk = "2000",
+    freq = "122.800", atc_type = "UNICOM", fir = "---", fir_freq = "",
+    next_fir = "---", dist = "---", etd = "---", eta = "---",
+    dep_qnh = "1013", arr_qnh = "1013", ta = "STBY",
+    arr_temp = "---", arr_wind = "---",
+    gate = "---", sid = "---", dep_rwy = "---", star = "---", approach = "---",
+    dep_metar_qnh = "1013", arr_metar_qnh = "1013",  -- NEW: METAR QNH
+    step_climb_fl = "---",  -- NEW: Next step climb FL
+    connected = false, vatsim_status = "offline", phase = "PARKED"
+}
 
 -- ============================================================================
 -- VATSIM DATA
@@ -165,10 +218,16 @@ local in_draw_loop = false  -- Safety flag for OpenGL calls
 local vatsim_data = nil
 
 local function fetch_vatsim()
-    if http then
-        log_msg("Fetching VATSIM data...")
-        local body, code = http.request("http://data.vatsim.net/v3/vatsim-data.json")
-        log_msg("HTTP response: " .. tostring(code))
+    local url = "https://data.vatsim.net/v3/vatsim-data.json"
+    local body = nil
+    local code = nil
+
+    -- Try HTTPS first (preferred - LuaSec)
+    if https then
+        log_msg("Fetching VATSIM data (HTTPS)...")
+        body, code = https.request(url)
+        log_msg("HTTPS response: " .. tostring(code))
+
         if code == 200 and body then
             local f = io.open(SCRIPT_DIRECTORY .. CONFIG.data_file, "w")
             if f then
@@ -177,12 +236,20 @@ local function fetch_vatsim()
                 log_msg("VATSIM data saved (" .. #body .. " bytes)")
             end
             return body
-        else
-            log_msg("HTTP FAILED: code=" .. tostring(code))
         end
-    else
-        log_msg("HTTP module not available!")
     end
+
+    -- Fallback: curl (available on modern Windows/Mac/Linux)
+    log_msg("Fetching via curl...")
+    local output_file = SCRIPT_DIRECTORY .. CONFIG.data_file
+    local cmd = 'curl -s -o "' .. output_file .. '" "' .. url .. '"'
+    local result = os.execute(cmd)
+    if result == 0 or result == true then
+        log_msg("curl fetch completed")
+    else
+        log_msg("curl fetch failed: " .. tostring(result))
+    end
+
     return nil
 end
 
@@ -374,6 +441,9 @@ local function load_xml()
                 -- ARR runway from destination
                 vatsim_fp.arr_rwy = extract_xml_nested(content, "destination", "plan_rwy") or ""
 
+                -- Gate from origin
+                vatsim_fp.gate = extract_xml_nested(content, "origin", "gate") or extract_xml(content, "departure_gate") or ""
+
                 -- METAR from origin and destination
                 vatsim_fp.dep_metar = extract_xml_nested(content, "origin", "metar") or ""
                 vatsim_fp.arr_metar = extract_xml_nested(content, "destination", "metar") or ""
@@ -396,7 +466,11 @@ local function load_xml()
                     end
                 end
 
-                log_msg("XML: " .. flightplan.origin .. "->" .. flightplan.destination .. " CS:" .. flightplan.callsign .. " SID:" .. vatsim_fp.sid .. " STAR:" .. vatsim_fp.star)
+                log_msg("XML: " .. flightplan.origin .. "->" .. flightplan.destination ..
+                    " CS:" .. flightplan.callsign ..
+                    " Gate:" .. vatsim_fp.gate ..
+                    " SID:" .. vatsim_fp.sid .. "/" .. vatsim_fp.dep_rwy ..
+                    " STAR:" .. vatsim_fp.star .. "/" .. vatsim_fp.arr_rwy)
             else
                 -- Parse FMS format
                 flightplan.origin = content:match("ADEP%s+([%w]+)") or ""
@@ -554,6 +628,90 @@ local function update()
 end
 
 -- ============================================================================
+-- DRAW CACHE UPDATE (must be before do_poll)
+-- ============================================================================
+local function update_draw_cache()
+    pcall(update_progress)
+
+    local dc = draw_cache
+    dc.origin = vatsim_fp.departure ~= "" and vatsim_fp.departure or flightplan.origin
+    dc.dest = vatsim_fp.arrival ~= "" and vatsim_fp.arrival or flightplan.destination
+    dc.cs = state.callsign ~= "" and state.callsign or "---"
+    dc.sqwk = UTILS.num_to_squawk(xp_transponder or 2000)
+
+    local raw_freq = xp_com1_freq or 0
+    dc.freq = raw_freq > 0 and UTILS.xplane_to_freq(raw_freq) or "122.800"
+    dc.atc_type = atc.current and atc.current.type or "UNICOM"
+    dc.fir = atc.fir or "---"
+    dc.fir_freq = atc.current and UTILS.format_freq(atc.current.frequency) or ""
+    dc.next_fir = atc.next_atc and atc.next_atc.callsign or "---"
+    dc.dist = progress.dist_to_dest > 0 and string.format("%dNM", math.floor(progress.dist_to_dest)) or "---"
+
+    -- ETD
+    if vatsim_fp.sched_etd > 0 then
+        dc.etd = os.date("!%H:%MZ", vatsim_fp.sched_etd)
+    elseif progress.etd_time then
+        dc.etd = os.date("!%H:%MZ", progress.etd_time)
+    else
+        dc.etd = "---"
+    end
+
+    -- ETA
+    if vatsim_fp.sched_eta > 0 then
+        dc.eta = os.date("!%H:%MZ", vatsim_fp.sched_eta)
+    elseif progress.eta_actual then
+        dc.eta = os.date("!%H:%MZ", progress.eta_actual)
+    elseif progress.eta_seconds > 0 then
+        dc.eta = os.date("!%H:%MZ", os.time() + progress.eta_seconds)
+    else
+        dc.eta = "---"
+    end
+
+    -- DEP weather
+    local dep_wx = UTILS.parse_metar(vatsim_fp.dep_metar)
+    dc.dep_qnh = tostring(dep_wx.qnh or progress.qnh_hpa)
+
+    -- Transponder mode
+    local xpdr_mode = xp_xpdr_mode or 1
+    if xpdr_mode == 0 then dc.ta = "OFF"
+    elseif xpdr_mode == 2 then dc.ta = "ON"
+    elseif xpdr_mode >= 3 then dc.ta = "TA"
+    else dc.ta = "STBY" end
+
+    -- ARR weather
+    local arr_wx = UTILS.parse_metar(vatsim_fp.arr_metar)
+    dc.arr_qnh = tostring(arr_wx.qnh or progress.qnh_hpa)
+
+    if arr_wx.temp then
+        dc.arr_temp = string.format("%d°C", arr_wx.temp)
+    elseif xp_temp_c then
+        dc.arr_temp = string.format("%d°C", math.floor(xp_temp_c))
+    else
+        dc.arr_temp = "---"
+    end
+
+    if arr_wx.wind_dir and arr_wx.wind_spd then
+        dc.arr_wind = string.format("%03d/%d", arr_wx.wind_dir, arr_wx.wind_spd)
+    elseif xp_wind_dir and xp_wind_speed then
+        dc.arr_wind = string.format("%03d/%d", math.floor(xp_wind_dir), math.floor(xp_wind_speed))
+    else
+        dc.arr_wind = "---"
+    end
+
+    -- Flight plan data
+    dc.gate = vatsim_fp.gate ~= "" and vatsim_fp.gate or "---"
+    dc.sid = vatsim_fp.sid ~= "" and vatsim_fp.sid or "---"
+    dc.dep_rwy = vatsim_fp.dep_rwy ~= "" and vatsim_fp.dep_rwy or "---"
+    dc.star = vatsim_fp.star ~= "" and vatsim_fp.star or "---"
+    dc.approach = vatsim_fp.approach ~= "" and vatsim_fp.approach or "---"
+
+    -- Colors
+    dc.connected = state.connected
+    dc.vatsim_status = state.vatsim_status
+    dc.phase = progress.phase
+end
+
+-- ============================================================================
 -- POLL
 -- ============================================================================
 local function do_poll()
@@ -570,6 +728,32 @@ local function do_poll()
     end
 
     update()
+    update_draw_cache()
+
+    -- ALARM SYSTEM: Check for data changes
+    if ALARMS then
+        local alarm_data = {
+            atc_callsign = draw_cache.atc_type,
+            atc_freq = draw_cache.freq,
+            squawk = draw_cache.sqwk,
+            fir = draw_cache.fir,
+            dep_qnh = draw_cache.dep_qnh,
+            arr_qnh = draw_cache.arr_qnh
+        }
+        ALARMS.check_data_changes(alarm_data)
+    end
+
+    -- XPLM FFI: Validate aircraft matches flight plan
+    if XPLM_FFI and flightplan.loaded then
+        -- Get expected aircraft from flight plan (would need to extract from SimBrief)
+        local expected_acft = flightplan.aircraft_type  -- Would need to add this field
+        if expected_acft then
+            local actual_acft = XPLM_FFI.get_aircraft_type()
+            if actual_acft and ALARMS then
+                ALARMS.check_aircraft_mismatch(expected_acft, actual_acft)
+            end
+        end
+    end
 end
 
 function vatc_sync_poll()
@@ -578,175 +762,361 @@ function vatc_sync_poll()
 end
 
 -- ============================================================================
--- DRAW
+-- IMGUI WINDOWS
 -- ============================================================================
-function vatc_sync_draw()
-    if not in_draw_loop then return end  -- Safety: only draw in draw loop
-    if not CONFIG.show_bar then return end
-    if not SCREEN_WIDTH or not SCREEN_HIGHT then return end
+local vatc_bar_wnd = nil
+local vatc_settings_wnd = nil
+local BAR_HEIGHT = 50
 
-    pcall(update_progress)
+-- Settings state (for imgui input)
+local settings_state = {
+    simbrief_id = "",
+    auto_tune_com1 = false,
+    auto_set_squawk = false,
+    auto_fetch_simbrief = true,
+    show_header_row = true
+}
 
-    local sw, sh = SCREEN_WIDTH, SCREEN_HIGHT
-    local row_h = 14
-    local bar_h = row_h * 2 + 6
-    local bar_y = sh - bar_h
-    local header_y = bar_y + row_h + 4
-    local data_y = bar_y + 2
-
-    local white = {1, 1, 1}
-    local gray = {0.5, 0.5, 0.5}
-    local sep_color = {0.4, 0.4, 0.4}
-
-    -- Segment colors
-    local segment = "DEP"
-    if progress.phase == "CRZ" then segment = "CRZ"
-    elseif progress.phase == "APPR" or progress.phase == "DESC" then segment = "ARR" end
-
-    local dep_color = segment == "DEP" and white or gray
-    local crz_color = segment == "CRZ" and white or gray
-    local arr_color = segment == "ARR" and white or gray
-
-    -- Status dot
-    local dot_color = {1, 0, 0}
-    if state.vatsim_status == "online" then dot_color = {0, 1, 0}
-    elseif state.vatsim_status == "prefiled" then dot_color = {1, 0.6, 0} end
-
-    if display.manually_hidden then
-        graphics.set_color(dot_color[1], dot_color[2], dot_color[3], 1)
-        graphics.draw_rectangle(sw - 26, sh - 20, sw - 14, sh - 8)
-        return
+-- Load settings from file
+local function load_settings()
+    local path = SCRIPT_DIRECTORY .. (CONFIG.settings_file or "vATC_sync_settings.ini")
+    local f = io.open(path, "r")
+    if not f then return end
+    for line in f:lines() do
+        local key, val = line:match("([^=]+)=(.+)")
+        if key and val then
+            key = key:match("^%s*(.-)%s*$")  -- trim
+            val = val:match("^%s*(.-)%s*$")
+            if key == "simbrief_pilot_id" then
+                CONFIG.simbrief_pilot_id = val
+                settings_state.simbrief_id = val
+            elseif key == "auto_tune_com1" then
+                CONFIG.auto_tune_com1 = (val == "true")
+                settings_state.auto_tune_com1 = CONFIG.auto_tune_com1
+            elseif key == "auto_set_squawk" then
+                CONFIG.auto_set_squawk = (val == "true")
+                settings_state.auto_set_squawk = CONFIG.auto_set_squawk
+            elseif key == "auto_fetch_simbrief" then
+                CONFIG.auto_fetch_simbrief = (val == "true")
+                settings_state.auto_fetch_simbrief = CONFIG.auto_fetch_simbrief
+            elseif key == "show_header_row" then
+                CONFIG.show_header_row = (val == "true")
+                settings_state.show_header_row = CONFIG.show_header_row
+            elseif key == "callsign" then
+                CONFIG.callsign = val
+            end
+        end
     end
-
-    -- Background
-    graphics.set_color(CONFIG.bar_color[1], CONFIG.bar_color[2], CONFIG.bar_color[3], CONFIG.bar_color[4])
-    graphics.draw_rectangle(0, bar_y, sw, bar_y + bar_h)
-
-    -- Data
-    local origin = vatsim_fp.departure ~= "" and vatsim_fp.departure or flightplan.origin
-    local dest = vatsim_fp.arrival ~= "" and vatsim_fp.arrival or flightplan.destination
-    local cs = state.callsign ~= "" and state.callsign or "---"
-    local sqwk = UTILS.num_to_squawk(xp_transponder or 2000)
-    -- COM1 freq from aircraft, default 122.800 UNICOM when offline or no freq
-    local raw_freq = xp_com1_freq or 0
-    local freq = "122.800"
-    if raw_freq > 0 then
-        freq = UTILS.xplane_to_freq(raw_freq)
-    end
-    local atc_type = atc.current and atc.current.type or "UNICOM"
-    local fir = atc.fir or "---"
-    local fir_freq = atc.current and UTILS.format_freq(atc.current.frequency) or ""
-    local next_fir = atc.next_atc and atc.next_atc.callsign or "---"
-    local dist = progress.dist_to_dest > 0 and string.format("%dNM", math.floor(progress.dist_to_dest)) or "---"
-    -- ETD: scheduled from SimBrief, or actual brake release time
-    local etd_str = "---"
-    if vatsim_fp.sched_etd > 0 then
-        etd_str = os.date("!%H:%MZ", vatsim_fp.sched_etd)
-    elseif progress.etd_time then
-        etd_str = os.date("!%H:%MZ", progress.etd_time)
-    end
-
-    -- ETA: scheduled from SimBrief, or estimated from GPS
-    local eta_str = "---"
-    if vatsim_fp.sched_eta > 0 then
-        eta_str = os.date("!%H:%MZ", vatsim_fp.sched_eta)
-    elseif progress.eta_actual then
-        eta_str = os.date("!%H:%MZ", progress.eta_actual)
-    elseif progress.eta_seconds > 0 then
-        eta_str = os.date("!%H:%MZ", os.time() + progress.eta_seconds)
-    end
-    local qnh = tostring(progress.qnh_hpa)
-
-    -- Columns
-    local pad = 5
-    local num_cols = 22
-    local col_width = math.max((sw - pad - 20) / num_cols, 38)
-    local c = {}
-    for i = 1, num_cols do c[i] = math.floor(pad + (i - 1) * col_width) end
-
-    local hc = white
-
-    -- Headers
-    draw_string(c[1], header_y, "DEP", hc[1], hc[2], hc[3])
-    draw_string(c[2], header_y, "Callsign", hc[1], hc[2], hc[3])
-    draw_string(c[3], header_y, "Freq", hc[1], hc[2], hc[3])
-    draw_string(c[4], header_y, "Gate", hc[1], hc[2], hc[3])
-    draw_string(c[5], header_y, "SID", hc[1], hc[2], hc[3])
-    draw_string(c[6], header_y, "RWY", hc[1], hc[2], hc[3])
-    draw_string(c[7], header_y, "SQWK", hc[1], hc[2], hc[3])
-    draw_string(c[8], header_y, "QNH", hc[1], hc[2], hc[3])
-    draw_string(c[9], header_y, "ETD", hc[1], hc[2], hc[3])
-    draw_string(c[10], header_y, "Dist", hc[1], hc[2], hc[3])
-    draw_string(c[11] - 8, header_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    draw_string(c[11], header_y, "FIR", hc[1], hc[2], hc[3])
-    draw_string(c[12], header_y, "Next", hc[1], hc[2], hc[3])
-    draw_string(c[13], header_y, "ToGo", hc[1], hc[2], hc[3])
-    draw_string(c[14] - 8, header_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    draw_string(c[14], header_y, "ATC", hc[1], hc[2], hc[3])
-    draw_string(c[15], header_y, "ETA", hc[1], hc[2], hc[3])
-    draw_string(c[16], header_y, "QNH", hc[1], hc[2], hc[3])
-    draw_string(c[17], header_y, "Temp", hc[1], hc[2], hc[3])
-    draw_string(c[18], header_y, "Wind", hc[1], hc[2], hc[3])
-    draw_string(c[19], header_y, "STAR", hc[1], hc[2], hc[3])
-    draw_string(c[20], header_y, "APP", hc[1], hc[2], hc[3])
-    draw_string(c[21], header_y, "ARR", hc[1], hc[2], hc[3])
-    draw_string(c[22] - 8, header_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    draw_string(c[22], header_y, "Online", hc[1], hc[2], hc[3])
-
-    -- Data row
-    draw_string(c[1], data_y, origin ~= "" and origin or "---", dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[2], data_y, cs, dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[3], data_y, atc_type .. ":" .. freq, dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[4], data_y, vatsim_fp.gate ~= "" and vatsim_fp.gate or "---", dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[5], data_y, vatsim_fp.sid ~= "" and vatsim_fp.sid or "---", dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[6], data_y, vatsim_fp.dep_rwy ~= "" and vatsim_fp.dep_rwy or "---", dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[7], data_y, sqwk, dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[8], data_y, qnh, dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[9], data_y, etd_str, dep_color[1], dep_color[2], dep_color[3])
-    draw_string(c[10], data_y, dist, dep_color[1], dep_color[2], dep_color[3])
-
-    draw_string(c[11] - 8, data_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    local fir_str = fir ~= "" and fir or "---"
-    if fir_freq ~= "" then fir_str = fir_str .. ":" .. fir_freq end
-    draw_string(c[11], data_y, fir_str, crz_color[1], crz_color[2], crz_color[3])
-    draw_string(c[12], data_y, next_fir, crz_color[1], crz_color[2], crz_color[3])
-    draw_string(c[13], data_y, dist, crz_color[1], crz_color[2], crz_color[3])
-
-    -- Weather data from X-Plane
-    local temp_str = xp_temp_c and string.format("%d°C", math.floor(xp_temp_c)) or "---"
-    local wind_str = "---"
-    if xp_wind_dir and xp_wind_speed then
-        wind_str = string.format("%03d/%d", math.floor(xp_wind_dir), math.floor(xp_wind_speed))
-    end
-
-    draw_string(c[14] - 8, data_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    draw_string(c[14], data_y, "---", arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[15], data_y, eta_str, arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[16], data_y, qnh, arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[17], data_y, temp_str, arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[18], data_y, wind_str, arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[19], data_y, vatsim_fp.star ~= "" and vatsim_fp.star or "---", arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[20], data_y, vatsim_fp.approach ~= "" and vatsim_fp.approach or "---", arr_color[1], arr_color[2], arr_color[3])
-    draw_string(c[21], data_y, dest ~= "" and dest or "---", arr_color[1], arr_color[2], arr_color[3])
-
-    draw_string(c[22] - 8, data_y, "|", sep_color[1], sep_color[2], sep_color[3])
-    graphics.set_color(dot_color[1], dot_color[2], dot_color[3], 1)
-    graphics.draw_rectangle(c[22] + 10, data_y + 2, c[22] + 22, data_y + 12)
+    f:close()
+    log_msg("Settings loaded")
 end
 
-function vatc_sync_draw_safe()
-    in_draw_loop = true
-    local ok, err = pcall(vatc_sync_draw)
-    in_draw_loop = false
-    if not ok then log_msg("Draw error: " .. tostring(err)) end
+-- Save settings to file
+local function save_settings()
+    local path = SCRIPT_DIRECTORY .. (CONFIG.settings_file or "vATC_sync_settings.ini")
+    local f = io.open(path, "w")
+    if not f then
+        log_msg("ERROR: Cannot save settings")
+        return
+    end
+    f:write("simbrief_pilot_id=" .. (CONFIG.simbrief_pilot_id or "") .. "\n")
+    f:write("auto_tune_com1=" .. tostring(CONFIG.auto_tune_com1) .. "\n")
+    f:write("auto_set_squawk=" .. tostring(CONFIG.auto_set_squawk) .. "\n")
+    f:write("auto_fetch_simbrief=" .. tostring(CONFIG.auto_fetch_simbrief) .. "\n")
+    f:write("show_header_row=" .. tostring(CONFIG.show_header_row) .. "\n")
+    f:write("callsign=" .. (CONFIG.callsign or "AUTO") .. "\n")
+    f:close()
+    log_msg("Settings saved")
+end
+
+-- Helper to convert RGB 0-1 to imgui color (ABGR hex)
+local function rgb_to_imgui(r, g, b, a)
+    a = a or 1
+    return math.floor(a * 255) * 0x1000000 +
+           math.floor(b * 255) * 0x10000 +
+           math.floor(g * 255) * 0x100 +
+           math.floor(r * 255)
+end
+
+-- Colors
+local COL_BG = rgb_to_imgui(0.12, 0.12, 0.12, 0.95)
+local COL_HEADER = rgb_to_imgui(0.5, 0.5, 0.5, 1)
+local COL_WHITE = rgb_to_imgui(1, 1, 1, 1)
+local COL_GRAY = rgb_to_imgui(0.5, 0.5, 0.5, 1)
+local COL_CYAN = rgb_to_imgui(0, 0.9, 1, 1)
+local COL_RED = rgb_to_imgui(1, 0, 0, 1)
+local COL_GREEN = rgb_to_imgui(0, 1, 0, 1)
+local COL_ORANGE = rgb_to_imgui(1, 0.6, 0, 1)
+local COL_SEP = rgb_to_imgui(0.4, 0.4, 0.4, 1)
+
+-- ============================================================================
+-- FLIGHT BAR (borderless overlay)
+-- ============================================================================
+function vatc_bar_builder(wnd, x, y)
+    if display.manually_hidden then return end
+
+    -- DYNAMIC FONT SCALING based on window width
+    local wnd_width, wnd_height = float_wnd_get_dimensions(wnd)
+    local screen_width = SCREEN_WIDTH or 1920
+    local base_width = 1920  -- Reference width
+    local font_scale = math.max(0.8, math.min(1.5, (wnd_width or base_width) / base_width))
+    imgui.SetWindowFontScale(font_scale)
+
+    -- Push borderless window style
+    imgui.PushStyleVar(imgui.constant.StyleVar.WindowBorderSize, 0)
+    imgui.PushStyleVar(imgui.constant.StyleVar.WindowRounding, 0)
+    imgui.PushStyleVar(imgui.constant.StyleVar.WindowPadding, 5, 5)
+
+    -- Pin/Unpin button (top right corner)
+    imgui.SetCursorPosX(imgui.GetWindowWidth() - 60)
+    if imgui.SmallButton(display.pinned and "Unpin" or "Pin") then
+        display.pinned = not display.pinned
+        if display.pinned then
+            -- Reposition to top
+            local sh = SCREEN_HIGHT or 1080
+            local h = CONFIG.show_header_row and BAR_HEIGHT or 30
+            float_wnd_set_position(wnd, 0, sh - h)
+        end
+    end
+
+    imgui.SameLine()
+    imgui.SetCursorPosX(5)  -- Reset to left side for content
+
+    local dc = draw_cache
+
+    -- Determine colors based on phase and online status
+    local segment = dc.phase == "CRZ" and "CRZ" or (dc.phase == "APPR" and "ARR" or "DEP")
+    local online_col = dc.connected and COL_CYAN or COL_WHITE
+
+    local dep_col = segment == "DEP" and online_col or COL_GRAY
+    local crz_col = segment == "CRZ" and online_col or COL_GRAY
+    local arr_col = segment == "ARR" and online_col or COL_GRAY
+
+    -- Status indicator color
+    local status_col = COL_RED
+    if dc.vatsim_status == "online" then status_col = COL_GREEN
+    elseif dc.vatsim_status == "prefiled" then status_col = COL_ORANGE end
+
+    -- Build FIR string
+    local fir_str = dc.fir or "---"
+    if dc.fir_freq and dc.fir_freq ~= "" then fir_str = fir_str .. ":" .. dc.fir_freq end
+
+    -- Header row (optional) - ENHANCED with METAR QNH and Step Climb
+    if CONFIG.show_header_row then
+        imgui.PushStyleColor(imgui.constant.Col.Text, COL_HEADER)
+        imgui.TextUnformatted("DEP      Callsign   ATC    Freq       Gate  SID      RWY   SQWK  QNH   METAR TA/RA ETD     Dist  | FIR          sFL   Next      ToGo  | ATC  ETA     QNH   METAR Temp  Wind      STAR     APP   ARR")
+        imgui.PopStyleColor()
+    end
+
+    -- Data row - DEP section (ENHANCED with METAR QNH)
+    imgui.PushStyleColor(imgui.constant.Col.Text, dep_col)
+    imgui.TextUnformatted(string.format("%-8s %-10s %-6s %-10s %-5s %-8s %-5s %-5s %-5s %-5s %-5s %-7s %-5s",
+        dc.origin or "---",
+        dc.cs or "---",
+        dc.atc_type or "UNICOM",
+        dc.freq or "122.800",
+        dc.gate or "---",
+        dc.sid or "---",
+        dc.dep_rwy or "---",
+        dc.sqwk or "2000",
+        dc.dep_qnh or "1013",
+        dc.dep_metar_qnh or "1013",  -- NEW: METAR QNH
+        dc.ta or "STBY",
+        dc.etd or "---",
+        dc.dist or "---"))
+    imgui.PopStyleColor()
+
+    -- CRZ + ARR section on same line
+    imgui.SameLine()
+    imgui.PushStyleColor(imgui.constant.Col.Text, COL_SEP)
+    imgui.TextUnformatted("|")
+    imgui.PopStyleColor()
+    imgui.SameLine()
+
+    imgui.PushStyleColor(imgui.constant.Col.Text, crz_col)
+    imgui.TextUnformatted(string.format("%-12s %-5s %-9s %-5s",
+        fir_str,
+        dc.step_climb_fl or "---",  -- NEW: Step climb FL
+        dc.next_fir or "---",
+        dc.dist or "---"))
+    imgui.PopStyleColor()
+
+    imgui.SameLine()
+    imgui.PushStyleColor(imgui.constant.Col.Text, COL_SEP)
+    imgui.TextUnformatted("|")
+    imgui.PopStyleColor()
+    imgui.SameLine()
+
+    imgui.PushStyleColor(imgui.constant.Col.Text, arr_col)
+    imgui.TextUnformatted(string.format("%-4s %-7s %-5s %-5s %-5s %-9s %-8s %-5s %-4s",
+        "---",
+        dc.eta or "---",
+        dc.arr_qnh or "1013",
+        dc.arr_metar_qnh or "1013",  -- NEW: Arrival METAR QNH
+        dc.arr_temp or "---",
+        dc.arr_wind or "---",
+        dc.star or "---",
+        dc.approach or "---",
+        dc.dest or "---"))
+    imgui.PopStyleColor()
+
+    -- Status indicator
+    imgui.SameLine()
+    imgui.PushStyleColor(imgui.constant.Col.Text, status_col)
+    imgui.TextUnformatted(" [*]")
+    imgui.PopStyleColor()
+
+    -- Pop style vars (borderless)
+    imgui.PopStyleVar(3)  -- WindowBorderSize, WindowRounding, WindowPadding
+end
+
+function vatc_bar_on_close(wnd)
+    vatc_bar_wnd = nil
+end
+
+function vatc_create_bar()
+    if vatc_bar_wnd then return end
+    local sw = SCREEN_WIDTH or 1920
+    local sh = SCREEN_HIGHT or 1080
+    local h = CONFIG.show_header_row and BAR_HEIGHT or 30
+
+    -- Create window with decoration OFF for borderless
+    vatc_bar_wnd = float_wnd_create(sw, h, 2, true)  -- Decoration mode 2 = borderless
+    float_wnd_set_title(vatc_bar_wnd, "vATC Sync")
+
+    -- Position at top of screen (always on top)
+    float_wnd_set_position(vatc_bar_wnd, 0, sh - h)
+
+    -- Set window properties for always-on-top behavior
+    float_wnd_set_imgui_builder(vatc_bar_wnd, "vatc_bar_builder")
+    float_wnd_set_onclose(vatc_bar_wnd, "vatc_bar_on_close")
+
+    -- Try to set topmost (if available in FWL version)
+    if float_wnd_set_topmost then
+        float_wnd_set_topmost(vatc_bar_wnd, true)
+    end
+end
+
+function vatc_destroy_bar()
+    if vatc_bar_wnd then
+        float_wnd_destroy(vatc_bar_wnd)
+        vatc_bar_wnd = nil
+    end
+end
+
+-- ============================================================================
+-- SETTINGS WINDOW (with border, for macro menu)
+-- ============================================================================
+function vatc_settings_builder(wnd, x, y)
+    imgui.SetWindowFontScale(1.2)
+
+    imgui.TextUnformatted("vATC Sync Settings")
+    imgui.Separator()
+    imgui.Dummy(0, 5)
+
+    -- SimBrief Pilot ID
+    imgui.TextUnformatted("SimBrief Pilot ID:")
+    local changed, new_val = imgui.InputText("##simbrief_id", settings_state.simbrief_id, 32)
+    if changed then
+        settings_state.simbrief_id = new_val
+        CONFIG.simbrief_pilot_id = new_val
+    end
+    imgui.Dummy(0, 10)
+
+    -- Checkboxes
+    imgui.TextUnformatted("Options:")
+    imgui.Separator()
+
+    local chg1, val1 = imgui.Checkbox("Show header row", settings_state.show_header_row)
+    if chg1 then
+        settings_state.show_header_row = val1
+        CONFIG.show_header_row = val1
+    end
+
+    local chg2, val2 = imgui.Checkbox("Auto-tune COM1", settings_state.auto_tune_com1)
+    if chg2 then
+        settings_state.auto_tune_com1 = val2
+        CONFIG.auto_tune_com1 = val2
+    end
+
+    local chg3, val3 = imgui.Checkbox("Auto-set squawk", settings_state.auto_set_squawk)
+    if chg3 then
+        settings_state.auto_set_squawk = val3
+        CONFIG.auto_set_squawk = val3
+    end
+
+    local chg4, val4 = imgui.Checkbox("Auto-fetch SimBrief", settings_state.auto_fetch_simbrief)
+    if chg4 then
+        settings_state.auto_fetch_simbrief = val4
+        CONFIG.auto_fetch_simbrief = val4
+    end
+
+    imgui.Dummy(0, 15)
+    imgui.Separator()
+
+    -- Save button
+    if imgui.Button("Save Settings") then
+        save_settings()
+    end
+
+    imgui.SameLine()
+    if imgui.Button("Close") then
+        vatc_destroy_settings()
+    end
+
+    imgui.Dummy(0, 10)
+    imgui.TextUnformatted("v" .. VERSION:get())
+end
+
+function vatc_settings_on_close(wnd)
+    vatc_settings_wnd = nil
+end
+
+function vatc_create_settings()
+    if vatc_settings_wnd then return end
+    vatc_settings_wnd = float_wnd_create(350, 320, 1, true)
+    float_wnd_set_title(vatc_settings_wnd, "vATC Sync Settings")
+    float_wnd_set_imgui_builder(vatc_settings_wnd, "vatc_settings_builder")
+    float_wnd_set_onclose(vatc_settings_wnd, "vatc_settings_on_close")
+end
+
+function vatc_destroy_settings()
+    if vatc_settings_wnd then
+        float_wnd_destroy(vatc_settings_wnd)
+        vatc_settings_wnd = nil
+    end
+end
+
+function vatc_toggle_settings()
+    if vatc_settings_wnd then
+        vatc_destroy_settings()
+    else
+        vatc_create_settings()
+    end
 end
 
 -- ============================================================================
 -- WINDOW FUNCTIONS
 -- ============================================================================
-function vatc_sync_show_wnd() display.manually_hidden = false; CONFIG.show_bar = true end
-function vatc_sync_hide_wnd() display.manually_hidden = true end
-function vatc_sync_toggle_wnd() display.manually_hidden = not display.manually_hidden end
+function vatc_sync_show_wnd()
+    display.manually_hidden = false
+    CONFIG.show_bar = true
+    vatc_create_bar()
+end
+
+function vatc_sync_hide_wnd()
+    display.manually_hidden = true
+    vatc_destroy_bar()
+end
+
+function vatc_sync_toggle_wnd()
+    display.manually_hidden = not display.manually_hidden
+    if display.manually_hidden then
+        vatc_destroy_bar()
+    else
+        vatc_create_bar()
+    end
+end
 
 -- ============================================================================
 -- INIT
@@ -756,14 +1126,25 @@ log_msg("========================================")
 log_msg("Initializing vATC Sync...")
 log_msg("Script dir: " .. tostring(SCRIPT_DIRECTORY))
 log_msg("Log file: " .. tostring(log_file_path))
+
+-- Load settings from file
+load_settings()
+
 load_xml()
 last_poll = os.time()
 last_fms_check = os.time()
 fetch_vatsim()
+update_draw_cache()
 
 -- FlyWithLua callbacks
 do_often("vatc_sync_poll()")
-do_every_draw("vatc_sync_draw_safe()")
+
+-- Create commands and macros
+create_command("FlyWithLua/vATC_Sync/toggle_bar", "Toggle vATC Sync bar", "vatc_sync_toggle_wnd()", "", "")
+create_command("FlyWithLua/vATC_Sync/settings", "Open vATC Sync settings", "vatc_toggle_settings()", "", "")
+
+add_macro("vATC Sync", "vatc_sync_show_wnd()", "vatc_sync_hide_wnd()", "activate")
+add_macro("vATC Settings", "vatc_create_settings()", "vatc_destroy_settings()", "deactivate")
 
 log_msg("vATC Sync " .. VERSION:get_full() .. " ready")
 logMsg("vATC Sync " .. VERSION:get_full() .. " loaded")

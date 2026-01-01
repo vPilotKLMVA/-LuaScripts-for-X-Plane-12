@@ -1,11 +1,24 @@
+-- ============================================================================
 -- vATC Sync - Configuration
+-- ============================================================================
+--
+-- Copyright (c) 2025 vPilot KLMVA
+-- Licensed under the MIT License
+-- GitHub: https://github.com/vPilotKLMVA/-LuaScripts-for-X-Plane-12
+--
+-- ============================================================================
+
 local CONFIG = {
     callsign = "AUTO",
     poll_interval = 15,
+    simbrief_pilot_id = "",
 
-    auto_tune_com1 = true,
-    auto_set_squawk = true,
+    auto_tune_com1 = false,
+    auto_set_squawk = false,
+    auto_fetch_simbrief = true,
+    show_header_row = true,
 
+-- if vatsimm dat is not available, or no atc controllers set auto default
     unicom_freq = 122.800,
     vfr_squawk = 2000,
 
@@ -20,7 +33,8 @@ local CONFIG = {
     show_bar = true,
     bar_color = {0.12, 0.12, 0.12, 0.9},
 
-    data_file = "vatsim_data.json"
+    data_file = "vatsim_data.json",
+    settings_file = "vATC_sync_settings.ini"
 }
 
 function CONFIG:get_data_path()

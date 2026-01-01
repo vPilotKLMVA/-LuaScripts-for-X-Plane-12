@@ -1,9 +1,18 @@
+-- ============================================================================
 -- vATC Sync - Version Info
+-- ============================================================================
+--
+-- Copyright (c) 2025 vPilot KLMVA
+-- Licensed under the MIT License
+-- GitHub: https://github.com/vPilotKLMVA/-LuaScripts-for-X-Plane-12
+--
+-- ============================================================================
+
 local VERSION = {
     major = 1,
-    minor = 3,
-    patch = 6,
-    build = "2025.12.31",
+    minor = 4,
+    patch = 0,
+    build = "2026.01.01",
 
     get = function(self)
         return string.format("v%d.%d.%d", self.major, self.minor, self.patch)

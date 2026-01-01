@@ -1,4 +1,13 @@
+-- ============================================================================
 -- vATC Sync - Utilities
+-- ============================================================================
+--
+-- Copyright (c) 2025 vPilot KLMVA
+-- Licensed under the MIT License
+-- GitHub: https://github.com/vPilotKLMVA/-LuaScripts-for-X-Plane-12
+--
+-- ============================================================================
+
 local UTILS = {}
 
 -- Calculate distance between two points in nautical miles
@@ -76,6 +85,51 @@ function UTILS.format_freq(freq_str)
     local freq = tonumber(freq_str)
     if not freq then return freq_str end
     return string.format("%.3f", freq)
+end
+
+-- Parse METAR for weather info
+-- Returns: { qnh=1013, temp=15, wind_dir=220, wind_spd=15 }
+function UTILS.parse_metar(metar)
+    local result = { qnh = nil, temp = nil, wind_dir = nil, wind_spd = nil }
+    if not metar or metar == "" then return result end
+
+    -- Wind: 22015KT or 220/15KT or VRB05KT
+    local dir, spd = metar:match("(%d%d%d)(%d%d)KT")
+    if dir and spd then
+        result.wind_dir = tonumber(dir)
+        result.wind_spd = tonumber(spd)
+    else
+        -- Variable wind
+        spd = metar:match("VRB(%d%d)KT")
+        if spd then
+            result.wind_dir = 0
+            result.wind_spd = tonumber(spd)
+        end
+    end
+
+    -- Temperature: M02/M05 or 12/05 (M = minus)
+    local temp = metar:match(" (M?%d%d)/(M?%d%d) ")
+    if temp then
+        if temp:sub(1, 1) == "M" then
+            result.temp = -tonumber(temp:sub(2))
+        else
+            result.temp = tonumber(temp)
+        end
+    end
+
+    -- QNH: Q1021 (hPa) or A2992 (inHg)
+    local qnh_hpa = metar:match("Q(%d%d%d%d)")
+    if qnh_hpa then
+        result.qnh = tonumber(qnh_hpa)
+    else
+        local qnh_inhg = metar:match("A(%d%d%d%d)")
+        if qnh_inhg then
+            -- Convert inHg*100 to hPa: A2992 = 29.92 inHg = 1013 hPa
+            result.qnh = math.floor(tonumber(qnh_inhg) / 100 * 33.8639 + 0.5)
+        end
+    end
+
+    return result
 end
 
 return UTILS
