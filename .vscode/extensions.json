@@ -1,8 +1,0 @@
-{
-    "recommendations": [
-        "blackboxapp.blackbox",
-        "sumneko.lua",
-        "yinfei.luahelper",
-        "dwenegar.vscode-luacheck"
-    ]
-}
