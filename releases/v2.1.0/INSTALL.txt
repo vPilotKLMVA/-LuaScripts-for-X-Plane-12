@@ -1,0 +1,61 @@
+==============================================
+vATC Flightbar Enhanced v2.1.0
+Installation Instructions
+==============================================
+
+QUICK INSTALL
+-------------
+1. Copy the entire "vATC" folder to:
+   X-Plane 12\Resources\plugins\
+
+2. Final structure should be:
+   X-Plane 12\Resources\plugins\vATC\64\win.xpl
+
+3. Restart X-Plane 12
+
+4. Check Plugins menu -> vATC Enhanced
+
+
+REQUIREMENTS
+------------
+- X-Plane 12 (Windows 64-bit)
+- Visual C++ Runtime 2019 or later
+  Download: https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+
+VERIFY INSTALLATION
+-------------------
+1. Start X-Plane 12
+2. Go to Plugins menu
+3. Look for "vATC Enhanced" menu item
+4. Click "Toggle Bar" - you should see a flight bar at top of screen
+
+
+FEATURES
+--------
+- Real-time flight data display
+- Weather information (QNH, temperature, wind)
+- Navigation data (GPS distance, ETA)
+- Flight phase detection (PARKED/TAXI/CLIMB/CRZ/APPR)
+- Color-coded status indicators
+
+
+TROUBLESHOOTING
+---------------
+Plugin not showing up:
+- Check Log.txt in X-Plane root folder
+- Verify folder structure is correct
+- Install Visual C++ Runtime
+
+Bar not visible:
+- Go to Plugins -> vATC Enhanced -> Toggle Bar
+
+Need help:
+- GitHub: https://github.com/vPilotKLMVA/vATC-Flightbar
+- Forum: https://forums.x-plane.org/profile/422092-pilot-mcwillem/
+
+
+==============================================
+Made with ❤️ for the X-Plane and VATSIM communities
+https://github.com/vPilotKLMVA
+==============================================
