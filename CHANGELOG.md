@@ -2,17 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v1.4.6] - 2026-01-03
+## [v1.4.7] - 2026-01-03
 
 ### Fixed
-- **CRITICAL**: Fixed incorrect FlyWithLua callback - was still using `do_every_draw()` instead of `do_on_draw()`
+- **CRITICAL**: Fixed fatal error - `do_on_draw()` does not exist in FlyWithLua!
+- Corrected callback to use `do_every_draw()` (the actual FlyWithLua function)
+- Script now loads without errors
+
+### Technical Details
+- Line 1130: Changed `do_on_draw()` to `do_every_draw()` (correct FlyWithLua function)
+- **Root cause**: v1.4.6 used non-existent function `do_on_draw()` causing "attempt to call global 'do_on_draw' (a nil value)" error
+- **Solution**: FlyWithLua uses `do_every_draw()` for ImGui rendering, NOT `do_on_draw()`
+
+---
+
+## [v1.4.6] - 2026-01-03 ❌ BROKEN
+
+### Fixed
+- ~~Fixed incorrect FlyWithLua callback~~ (WRONG - used non-existent `do_on_draw()`)
 - Fixed METAR QNH columns not being populated in display (dep_metar_qnh, arr_metar_qnh now show actual METAR data)
 - Fixed log file naming - now uses "vATC_Log.txt" consistently (was "vATClog.log")
 
-### Technical Details
-- Line 1128: Changed `do_every_draw()` to `do_on_draw()` (FlyWithLua NG+ requirement)
-- Lines 690, 702: Added proper METAR QNH extraction to draw cache
-- Lines 21, 24: Updated log file path to "vATC_Log.txt"
+### Known Issues
+- **FATAL**: Used `do_on_draw()` which doesn't exist → script won't load
 
 ---
 
@@ -107,8 +119,9 @@ All notable changes to this project will be documented in this file.
 
 | Version | Date | Status | Notes |
 |---------|------|--------|-------|
-| v1.4.6 | 2026-01-03 | ✅ Current | Complete repair - METAR QNH, callbacks, logging |
-| v1.4.5 | 2026-01-02 | ⚠️ Partial | Incomplete callback fix |
+| v1.4.7 | 2026-01-03 | ✅ Current | Fixed callback - uses correct do_every_draw() |
+| v1.4.6 | 2026-01-03 | ❌ FATAL | Used non-existent do_on_draw() function |
+| v1.4.5 | 2026-01-02 | ❌ FATAL | Same as v1.4.6 - bad callback |
 | v1.4.4 | 2026-01-02 | ⚠️ Broken | Wrong ImGui callback function |
 | v1.4.3 | 2026-01-02 | ⚠️ Broken | Fixed files, but wrong callback |
 | v1.4.2 | 2026-01-02 | ⚠️ Broken | Missing version.lua file |

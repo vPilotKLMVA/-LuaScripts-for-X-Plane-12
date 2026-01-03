@@ -11,7 +11,7 @@
 local VERSION = {
     major = 1,
     minor = 4,
-    patch = 6,
+    patch = 7,
     build = "2026.01.03",
 
     get = function(self)

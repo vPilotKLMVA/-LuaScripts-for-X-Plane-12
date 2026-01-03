@@ -1126,8 +1126,8 @@ function vatc_draw_windows()
     end
 end
 
--- Register ImGui callback (FlyWithLua NG+ requires do_on_draw for ImGui)
-do_on_draw("vatc_draw_windows()")
+-- Register ImGui callback (FlyWithLua uses do_every_draw for ImGui rendering)
+do_every_draw("vatc_draw_windows()")
 
 -- ============================================================================
 -- INIT
